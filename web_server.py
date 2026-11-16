@@ -5,6 +5,7 @@ import queue
 import threading
 import traceback
 import logging
+import asyncio
 from pathlib import Path
 from typing import Dict, Any, Optional
 from fastapi import FastAPI, Request
@@ -26,9 +27,20 @@ logging.basicConfig(level=logging.INFO)
 app = FastAPI(title="CivicAudit AI Server")
 
 # Enable CORS for decoupled frontend architectures (e.g. Next.js on port 3000)
+allowed_origins = [
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+    "http://localhost:8000",
+    "http://127.0.0.1:8000",
+]
+env_frontend = os.getenv("FRONTEND_URL", "").strip()
+if env_frontend and env_frontend not in allowed_origins:
+    allowed_origins.append(env_frontend)
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=allowed_origins,
+    allow_origin_regex=r"^https?://(localhost|127\.0\.0\.1|[\w\.-]+)(:\d+)?$",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -333,127 +345,176 @@ def upload_and_audit(req: FileUploadRequest):
         return JSONResponse(status_code=500, content={"error": f"Document processing failed: {str(e)}"})
 
 @app.post("/api/audit_stream")
-def execute_streaming_audit(req: StreamAuditRequest):
-    def event_stream():
-        events = queue.Queue()
-        accumulated_logs = []
+async def execute_streaming_audit(req: StreamAuditRequest, request: Request):
+    cancel_event = threading.Event()
+    events = queue.Queue()
+    accumulated_logs = []
 
-        def log_capture(phase, msg, data=None, progress=None):
-            formatted = f"[{phase}] {msg}"
-            accumulated_logs.append(formatted)
+    def check_cancelled() -> bool:
+        return cancel_event.is_set()
+
+    def log_capture(phase, msg, data=None, progress=None):
+        if cancel_event.is_set():
+            raise InterruptedError("Client disconnected. Aborting audit to preserve API tokens.")
+        formatted = f"[{phase}] {msg}"
+        accumulated_logs.append(formatted)
+        events.put({
+            "type": "progress",
+            "phase": phase,
+            "message": msg,
+            "log": formatted,
+            "progress": progress or {}
+        })
+
+    def run_investigation():
+        try:
+            if cancel_event.is_set():
+                return
+
+            orchestrator = CivicAuditOrchestrator(
+                step_callback=log_capture,
+                is_cancelled=check_cancelled
+            )
+
+            if req.mode == "sample":
+                clean_filename = Path(req.sample or "municipal_it_tender_2025.json").name
+                sample_path = (AuditConfig.SAMPLES_DIR / clean_filename).resolve()
+                samples_dir_resolved = AuditConfig.SAMPLES_DIR.resolve()
+
+                if not sample_path.is_relative_to(samples_dir_resolved) or not sample_path.exists():
+                    sample_path = AuditConfig.SAMPLES_DIR / "municipal_it_tender_2025.json"
+
+                if sample_path.suffix.lower() == ".csv":
+                    items = ProcurementParserTool.parse_from_csv(sample_path)
+                    tender_data = {
+                        "tender_id": f"CSV-{sample_path.stem.upper()}",
+                        "title": f"Government Bill of Quantities ({sample_path.name})",
+                        "procuring_entity": "Municipal Public Works Department",
+                        "items": [it.model_dump() for it in items]
+                    }
+                else:
+                    with open(sample_path, "r", encoding="utf-8") as f:
+                        tender_data = json.load(f)
+
+                if cancel_event.is_set():
+                    return
+
+                dossier = orchestrator.audit_tender(
+                    tender_id=tender_data.get("tender_id", req.tender_id or "TND-999"),
+                    title=tender_data.get("title", req.title or "Public Municipal Tender"),
+                    procuring_entity=tender_data.get("procuring_entity", req.procuring_entity or "Government Municipal Board"),
+                    tender_source_data=tender_data
+                )
+
+            elif req.mode == "upload":
+                if not req.file_base64:
+                    raise ValueError("No file content provided for upload.")
+
+                if len(req.file_base64) > 35 * 1024 * 1024:
+                    raise ValueError("File size exceeds 25MB statutory limit.")
+
+                base64_str = req.file_base64
+                if "," in base64_str:
+                    base64_str = base64_str.split(",", 1)[1]
+                file_bytes = base64.b64decode(base64_str)
+
+                extracted_text = FileExtractor.process_uploaded_file(req.filename or "uploaded.txt", file_bytes)
+                tender_data = {
+                    "tender_id": req.tender_id or "UPLOAD-TND-2025",
+                    "title": req.title or "Uploaded Tender Document",
+                    "procuring_entity": req.procuring_entity or "Public Procurement Authority",
+                    "raw_text": extracted_text
+                }
+                if req.filename and req.filename.lower().endswith(".json"):
+                    try:
+                        json_obj = json.loads(extracted_text)
+                        if "items" in json_obj:
+                            tender_data = json_obj
+                    except Exception:
+                        pass
+
+                if cancel_event.is_set():
+                    return
+
+                dossier = orchestrator.audit_tender(
+                    tender_id=req.tender_id or "UPLOAD-TND-2025",
+                    title=req.title or "Uploaded Tender Document",
+                    procuring_entity=req.procuring_entity or "Public Procurement Authority",
+                    tender_source_data=tender_data
+                )
+
+            else:  # "custom" raw text
+                if cancel_event.is_set():
+                    return
+
+                tender_data = {
+                    "tender_id": req.tender_id or "CUSTOM-TND-2025",
+                    "title": req.title or "Real-World Procurement Tender",
+                    "procuring_entity": req.procuring_entity or "Public Works & Procurement Directorate",
+                    "raw_text": req.raw_text or ""
+                }
+                dossier = orchestrator.audit_tender(
+                    tender_id=req.tender_id or "CUSTOM-TND-2025",
+                    title=req.title or "Real-World Procurement Tender",
+                    procuring_entity=req.procuring_entity or "Public Works & Procurement Directorate",
+                    tender_source_data=tender_data
+                )
+
+            if cancel_event.is_set():
+                return
+
+            markdown_dossier = DossierGeneratorTool.render_markdown(dossier)
+
             events.put({
-                "type": "progress",
-                "phase": phase,
-                "message": msg,
-                "log": formatted,
-                "progress": progress or {}
+                "type": "complete",
+                "dossier": dossier.model_dump(),
+                "logs": accumulated_logs,
+                "markdown": markdown_dossier
             })
-
-        def run_investigation():
-            try:
-                orchestrator = CivicAuditOrchestrator(step_callback=log_capture)
-
-                if req.mode == "sample":
-                    clean_filename = Path(req.sample or "municipal_it_tender_2025.json").name
-                    sample_path = (AuditConfig.SAMPLES_DIR / clean_filename).resolve()
-                    samples_dir_resolved = AuditConfig.SAMPLES_DIR.resolve()
-
-                    if not sample_path.is_relative_to(samples_dir_resolved) or not sample_path.exists():
-                        sample_path = AuditConfig.SAMPLES_DIR / "municipal_it_tender_2025.json"
-
-                    if sample_path.suffix.lower() == ".csv":
-                        items = ProcurementParserTool.parse_from_csv(sample_path)
-                        tender_data = {
-                            "tender_id": f"CSV-{sample_path.stem.upper()}",
-                            "title": f"Government Bill of Quantities ({sample_path.name})",
-                            "procuring_entity": "Municipal Public Works Department",
-                            "items": [it.model_dump() for it in items]
-                        }
-                    else:
-                        with open(sample_path, "r", encoding="utf-8") as f:
-                            tender_data = json.load(f)
-
-                    dossier = orchestrator.audit_tender(
-                        tender_id=tender_data.get("tender_id", req.tender_id or "TND-999"),
-                        title=tender_data.get("title", req.title or "Public Municipal Tender"),
-                        procuring_entity=tender_data.get("procuring_entity", req.procuring_entity or "Government Municipal Board"),
-                        tender_source_data=tender_data
-                    )
-
-                elif req.mode == "upload":
-                    if not req.file_base64:
-                        raise ValueError("No file content provided for upload.")
-
-                    base64_str = req.file_base64
-                    if "," in base64_str:
-                        base64_str = base64_str.split(",", 1)[1]
-                    file_bytes = base64.b64decode(base64_str)
-
-                    extracted_text = FileExtractor.process_uploaded_file(req.filename or "uploaded.txt", file_bytes)
-                    tender_data = {
-                        "tender_id": req.tender_id or "UPLOAD-TND-2025",
-                        "title": req.title or "Uploaded Tender Document",
-                        "procuring_entity": req.procuring_entity or "Public Procurement Authority",
-                        "raw_text": extracted_text
-                    }
-                    if req.filename and req.filename.lower().endswith(".json"):
-                        try:
-                            json_obj = json.loads(extracted_text)
-                            if "items" in json_obj:
-                                tender_data = json_obj
-                        except Exception:
-                            pass
-
-                    dossier = orchestrator.audit_tender(
-                        tender_id=req.tender_id or "UPLOAD-TND-2025",
-                        title=req.title or "Uploaded Tender Document",
-                        procuring_entity=req.procuring_entity or "Public Procurement Authority",
-                        tender_source_data=tender_data
-                    )
-
-                else:  # "custom" raw text
-                    tender_data = {
-                        "tender_id": req.tender_id or "CUSTOM-TND-2025",
-                        "title": req.title or "Real-World Procurement Tender",
-                        "procuring_entity": req.procuring_entity or "Public Works & Procurement Directorate",
-                        "raw_text": req.raw_text or ""
-                    }
-                    dossier = orchestrator.audit_tender(
-                        tender_id=req.tender_id or "CUSTOM-TND-2025",
-                        title=req.title or "Real-World Procurement Tender",
-                        procuring_entity=req.procuring_entity or "Public Works & Procurement Directorate",
-                        tender_source_data=tender_data
-                    )
-
-                markdown_dossier = DossierGeneratorTool.render_markdown(dossier)
-
-                events.put({
-                    "type": "complete",
-                    "dossier": dossier.model_dump(),
-                    "logs": accumulated_logs,
-                    "markdown": markdown_dossier
-                })
-            except Exception as e:
+        except InterruptedError:
+            logger.info("Audit run successfully interrupted and halted to preserve API tokens.")
+        except Exception as e:
+            if not cancel_event.is_set():
                 logger.error(f"Streaming audit error: {e}", exc_info=True)
                 events.put({
                     "type": "error",
                     "error": str(e),
                     "traceback": traceback.format_exc()
                 })
-            finally:
-                events.put(None)
+        finally:
+            events.put(None)
 
-        worker = threading.Thread(target=run_investigation, daemon=True)
-        worker.start()
+    worker = threading.Thread(target=run_investigation, daemon=True)
+    worker.start()
 
-        while True:
-            try:
-                ev = events.get(timeout=60)
+    async def event_stream():
+        try:
+            while True:
+                # Active disconnect check to immediately release server resources and preserve API tokens
+                if await request.is_disconnected():
+                    logger.warning("Client disconnected from SSE stream. Triggering token-guard cancellation.")
+                    cancel_event.set()
+                    break
+
+                try:
+                    ev = events.get_nowait()
+                except queue.Empty:
+                    await asyncio.sleep(0.2)
+                    continue
+
                 if ev is None:
                     break
+
                 yield f"data: {json.dumps(ev)}\n\n"
-            except queue.Empty:
-                yield ": keep-alive\n\n"
+        except (asyncio.CancelledError, GeneratorExit):
+            logger.warning("SSE Stream connection terminated by client. Halting background agent worker.")
+            cancel_event.set()
+            raise
+        except Exception as e:
+            logger.error(f"Error during streaming: {e}")
+            cancel_event.set()
+        finally:
+            cancel_event.set()
 
     return StreamingResponse(
         event_stream(),
