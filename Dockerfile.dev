@@ -1,0 +1,34 @@
+# ==============================================================================
+# CivicAudit AI - Backend Development Dockerfile
+# With Live Hot-Reloading & Test Utilities
+# ==============================================================================
+
+FROM python:3.13-slim AS development
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PYTHONPATH=/app \
+    ENVIRONMENT=development \
+    PORT=8000 \
+    HOST=0.0.0.0
+
+WORKDIR /app
+
+# Install curl and procps for monitoring & health checks
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends curl procps && \
+    rm -rf /var/lib/apt/lists/*
+
+# Install dependencies
+COPY requirements.txt .
+RUN pip install --no-cache-dir --upgrade pip && \
+    pip install --no-cache-dir -r requirements.txt
+
+# Copy source code (will be overridden by volume mount in dev compose)
+COPY . .
+
+# Expose API port
+EXPOSE 8000
+
+# Start Uvicorn with auto-reload for local development
+CMD ["uvicorn", "web_server:app", "--host", "0.0.0.0", "--port", "8000", "--reload", "--reload-dir", "/app"]

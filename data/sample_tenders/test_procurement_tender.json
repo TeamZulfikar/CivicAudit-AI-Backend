@@ -1,0 +1,56 @@
+{
+  "tender_id": "CIVIC-GOV-2025-992",
+  "title": "Metropolitan Digital Health Center IT & Infrastructure Modernization",
+  "procuring_entity": "Department of Public Health & Municipal Welfare",
+  "submission_date": "2025-11-15",
+  "items": [
+    {
+      "item_id": "BOQ-001",
+      "name": "Enterprise Core i7 Healthcare Workstation (32GB RAM, 1TB NVMe SSD)",
+      "specification": "Medical Grade Certified Mini Tower with Windows 11 Pro",
+      "category": "Computing Equipment",
+      "quantity": 25,
+      "quoted_unit_price": 3450.00
+    },
+    {
+      "item_id": "BOQ-002",
+      "name": "Standard OEM 65W USB-C Power Adapter & Charging Cable",
+      "specification": "Universal USB Type-C 65W Wall Fast Charger (6-foot braided cord)",
+      "category": "Peripherals & Accessories",
+      "quantity": 100,
+      "quoted_unit_price": 185.00
+    },
+    {
+      "item_id": "BOQ-003",
+      "name": "Cat6 Snagless Gigabit Ethernet Patch Cable (3-Meter / 10ft)",
+      "specification": "24 AWG Bare Copper Shielded RJ45 Network Cable",
+      "category": "Networking Infrastructure",
+      "quantity": 150,
+      "quoted_unit_price": 48.50
+    },
+    {
+      "item_id": "BOQ-004",
+      "name": "10kVA Online Double-Conversion Rackmount UPS with SNMP Management Card",
+      "specification": "True sine wave 208/230V, hot-swappable batteries with 3-Year 24/7 on-site SLA",
+      "category": "Emergency Power Infrastructure",
+      "quantity": 2,
+      "quoted_unit_price": 3850.00
+    },
+    {
+      "item_id": "BOQ-005",
+      "name": "24-inch Clinical Review DICOM Diagnostic Display Monitor",
+      "specification": "Full HD 1920x1080 IPS Medical Grade Anti-Glare Display with Calibration Sensor",
+      "category": "Medical Imaging Displays",
+      "quantity": 25,
+      "quoted_unit_price": 420.00
+    },
+    {
+      "item_id": "BOQ-006",
+      "name": "High-Volume Industrial Thermal Label & Patient Barcode Wristband Printer",
+      "specification": "300 DPI Direct Thermal/Thermal Transfer Network Printer (ZPL II Compatible)",
+      "category": "Clinical Output Hardware",
+      "quantity": 8,
+      "quoted_unit_price": 1950.00
+    }
+  ]
+}
