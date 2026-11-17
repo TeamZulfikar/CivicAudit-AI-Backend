@@ -519,6 +519,23 @@ class LLMClient:
             if isinstance(parsed, list):
                 return parsed
         except Exception as e:
+            # Resilient recovery for partial/truncated LLM outputs
+            try:
+                obj_matches = re.findall(r'\{[^{}]*\}', raw_res)
+                repaired = []
+                for om in obj_matches:
+                    try:
+                        clean_om = re.sub(r',\s*\}', '}', om)
+                        item = json.loads(clean_om)
+                        if isinstance(item, dict) and any(k in item for k in ["name", "item_name", "description"]):
+                            repaired.append(item)
+                    except Exception:
+                        continue
+                if repaired:
+                    logger.info(f"✅ Recovered {len(repaired)} items from partial/truncated LLM response.")
+                    return repaired
+            except Exception:
+                pass
             logger.warning(f"Failed to parse LLM JSON extraction: {e}")
         return None
 

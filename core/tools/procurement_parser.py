@@ -47,18 +47,34 @@ class ProcurementParserTool:
             if not isinstance(it, dict):
                 continue
             name = str(it.get("name") or it.get("item_name") or it.get("description") or f"Procurement Item {idx}").strip()
-            if not name or name.lower() in ["total", "grand total", "subtotal", "sub-total", "vat", "tax"]:
+            # Clean enclosing quotes, braces, colons from name
+            name = re.sub(r'^["\'\{\}\:\,\s]+|["\'\{\}\:\,\s]+$', '', name).strip()
+            
+            # Skip metadata keys or summary headers
+            if not name or any(name.lower().startswith(bad) for bad in [
+                "tender_id", '"tender_id"', "title", '"title"', "procuring_entity",
+                "items", "line_items", "total", "grand total", "subtotal", "sub-total", "vat", "tax", "{", "}"
+            ]):
                 continue
                 
             spec = str(it.get("specification") or it.get("specs") or "Standard commercial specification").strip()
+            spec = re.sub(r'^["\'\{\}\:\,\s]+|["\'\{\}\:\,\s]+$', '', spec).strip()
             category = str(it.get("category") or "General Goods").strip()
             quantity = safe_int(it.get("quantity", 1), default=1)
+            if quantity <= 0:
+                quantity = 1
             
             unit_price = safe_float(it.get("quoted_unit_price") or it.get("unit_price") or it.get("rate") or 0.0)
             total_price = safe_float(it.get("quoted_total_price") or it.get("total_price") or it.get("amount") or 0.0)
             
-            # Cross-calculate if one is missing
-            if unit_price <= 0 and total_price > 0:
+            # Cross-calculate and auto-correct unit vs total price
+            if quantity > 1 and total_price > 0:
+                # If unit price was accidentally set to total price or is 0
+                if abs(unit_price - total_price) < 0.01 or unit_price > total_price or unit_price <= 0:
+                    unit_price = round(total_price / quantity, 2)
+                elif abs(unit_price * quantity - total_price) > (total_price * 0.4) and unit_price > (total_price / quantity * 2.5):
+                    unit_price = round(total_price / quantity, 2)
+            elif unit_price <= 0 and total_price > 0:
                 unit_price = round(total_price / max(1, quantity), 2)
             elif total_price <= 0 and unit_price > 0:
                 total_price = round(unit_price * max(1, quantity), 2)
@@ -95,16 +111,29 @@ class ProcurementParserTool:
 
             cleaned_csv = re.sub(r'(?<=\d),(?=\d{3}\b)', '', raw_text)
 
+            # Smart Header Row Auto-Detection:
+            # Handles real-world tenders where rows 0-3 contain ministry titles, dates, or blanks
+            lines = [line for line in cleaned_csv.splitlines() if line.strip()]
+            header_row_idx = 0
+            header_keywords = ["item", "description", "particular", "qty", "quantity", "rate", "price", "amount", "unit", "spec", "code"]
+            for idx, line in enumerate(lines[:10]):
+                lower_line = line.lower()
+                matches = sum(1 for kw in header_keywords if kw in lower_line)
+                if matches >= 2:
+                    header_row_idx = idx
+                    break
+
             if pd is not None:
                 try:
-                    df = pd.read_csv(io.StringIO(cleaned_csv), index_col=False)
+                    df = pd.read_csv(io.StringIO(cleaned_csv), skiprows=header_row_idx, index_col=False)
                     columns = list(df.columns)
                     rows = [row.to_dict() for _, row in df.iterrows()]
                 except Exception:
                     rows = []
 
             if not rows and cleaned_csv:
-                reader = csv.DictReader(io.StringIO(cleaned_csv))
+                csv_slice = "\n".join(lines[header_row_idx:]) if lines else cleaned_csv
+                reader = csv.DictReader(io.StringIO(csv_slice))
                 if reader.fieldnames:
                     columns = [str(f) for f in reader.fieldnames]
                     rows = list(reader)
@@ -177,8 +206,9 @@ class ProcurementParserTool:
                     raw_name = str(row.get(name_col) or "").strip()
                     if not raw_name or raw_name.lower() in [
                         "nan", "none", "null", "total", "grand total", "subtotal", "sub-total",
-                        "vat", "tax", "signature", "authorized signature", "date"
-                    ]:
+                        "vat", "tax", "signature", "authorized signature", "date",
+                        "tender_id", "boq_id", "tender no", "status", "organization"
+                    ] or any(raw_name.lower().startswith(m) for m in ['"tender_id"', "tender_id:", "tender_id"]):
                         continue
 
                     # Extract ID and clean product name
@@ -212,7 +242,17 @@ class ProcurementParserTool:
                     unit_price = safe_float(row.get(price_col), default=0.0) if price_col and _notna(row.get(price_col)) else 0.0
                     total_price = safe_float(row.get(total_col), default=0.0) if total_col and _notna(row.get(total_col)) else 0.0
                     
-                    if unit_price <= 0 and total_price > 0:
+                    # Unit vs Total Price Reconciliation:
+                    # In real-world BOQs, line total is often erroneously placed in the unit rate column,
+                    # or unit rate is left blank or identical to line total when qty > 1.
+                    if qty > 1 and total_price > 0:
+                        if abs(unit_price - total_price) < 0.01 or unit_price >= total_price or unit_price <= 0:
+                            unit_price = round(total_price / qty, 2)
+                        elif abs(unit_price * qty - total_price) > (total_price * 0.4) and unit_price > (total_price / qty * 2.5):
+                            unit_price = round(total_price / qty, 2)
+                    elif qty > 1 and unit_price > 0 and total_price <= 0:
+                        total_price = round(unit_price * qty, 2)
+                    elif unit_price <= 0 and total_price > 0:
                         unit_price = round(total_price / max(1, qty), 2)
                     elif total_price <= 0 and unit_price > 0:
                         total_price = round(unit_price * max(1, qty), 2)
@@ -244,18 +284,35 @@ class ProcurementParserTool:
         if not raw_text or not raw_text.strip():
             return []
 
-        # Stage 0: Direct JSON parsing check
+        # Stage 0: Direct JSON parsing check (handles raw JSON, markdown-wrapped JSON, and repaired JSON)
         clean_text = raw_text.strip()
-        if clean_text.startswith("{") or clean_text.startswith("["):
+        clean_json_text = re.sub(r'^```(?:json)?\s*', '', clean_text, flags=re.MULTILINE)
+        clean_json_text = re.sub(r'```\s*$', '', clean_json_text, flags=re.MULTILINE).strip()
+
+        if clean_json_text.startswith("{") or clean_json_text.startswith("["):
             try:
-                parsed_json = json.loads(clean_text)
+                parsed_json = json.loads(clean_json_text)
                 if isinstance(parsed_json, dict):
                     if any(k in parsed_json for k in ["items", "line_items", "boq_items"]):
                         return ProcurementParserTool.parse_from_json(parsed_json)
                 elif isinstance(parsed_json, list):
                     return ProcurementParserTool.parse_from_json({"items": parsed_json})
             except Exception:
-                pass
+                # Truncated or malformed JSON repair
+                try:
+                    obj_matches = re.findall(r'\{[^{}]*\}', clean_json_text)
+                    recovered_items = []
+                    for om in obj_matches:
+                        try:
+                            item_obj = json.loads(om)
+                            if isinstance(item_obj, dict) and any(k in item_obj for k in ["name", "item_name", "description"]):
+                                recovered_items.append(item_obj)
+                        except Exception:
+                            continue
+                    if recovered_items:
+                        return ProcurementParserTool.parse_from_json({"items": recovered_items})
+                except Exception:
+                    pass
 
         # Stage 1: Fast Structured CSV / Tabular Parsing via Pandas (Instant, Zero LLM Tokens)
         # If the input text is a valid CSV (commas with rows), parse directly with Pandas first.
@@ -289,6 +346,19 @@ class ProcurementParserTool:
                             
                         qty = safe_int(it.get("quantity", 1), default=1)
                         unit_price = safe_float(it.get("quoted_unit_price", 0.0), default=0.0)
+                        total_price = safe_float(it.get("quoted_total_price", 0.0), default=0.0)
+
+                        if qty > 1 and total_price > 0:
+                            if abs(unit_price - total_price) < 0.01 or unit_price >= total_price or unit_price <= 0:
+                                unit_price = round(total_price / qty, 2)
+                            elif abs(unit_price * qty - total_price) > (total_price * 0.4) and unit_price > (total_price / qty * 2.5):
+                                unit_price = round(total_price / qty, 2)
+                        elif qty > 1 and unit_price > 0 and total_price <= 0:
+                            total_price = round(unit_price * qty, 2)
+                        elif unit_price <= 0 and total_price > 0:
+                            unit_price = round(total_price / max(1, qty), 2)
+                        elif total_price <= 0 and unit_price > 0:
+                            total_price = round(unit_price * max(1, qty), 2)
                         
                         if unit_price > 0:
                             extracted.append(ProcurementLineItem(
@@ -298,7 +368,7 @@ class ProcurementParserTool:
                                 category=str(it.get("category") or "AI Ingested"),
                                 quantity=qty,
                                 quoted_unit_price=unit_price,
-                                quoted_total_price=round(unit_price * qty, 2)
+                                quoted_total_price=total_price if total_price > 0 else round(unit_price * qty, 2)
                             ))
                     if extracted:
                         return extracted
@@ -313,6 +383,12 @@ class ProcurementParserTool:
         for line in lines:
             # Skip obvious header/footer rows
             if line.lower().startswith(("page ", "total", "subtotal", "grand total", "signature", "date:")):
+                continue
+
+            # Skip JSON structure rows and JSON metadata key-value pairs
+            if re.match(r'^\s*["\']?[a-zA-Z0-9_\-]+["\']?\s*:\s*["\']?[^"\']+["\']?,?\s*$', line) or line in ["{", "}", "[", "]", "},", "],"]:
+                continue
+            if any(bad in line.lower() for bad in ['"tender_id"', '"title"', '"procuring_entity"', '"items"', '"line_items"', '"specification"']):
                 continue
 
             # Case 1: Tabular split by tabs, pipes, or 2+ spaces
