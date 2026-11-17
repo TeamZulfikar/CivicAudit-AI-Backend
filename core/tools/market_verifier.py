@@ -646,11 +646,19 @@ class MarketVerifierTool:
     @classmethod
     def _search_live_web_price(cls, query: Union[str, List[str]], quoted_price: float = 0.0) -> Optional[Dict[str, Any]]:
         # Always try fresh live search in real-time across candidate queries
-        query_list = [query] if isinstance(query, str) else query
+        if not query:
+            return None
+        if isinstance(query, str):
+            query_list = [query]
+        elif isinstance(query, (list, tuple, set)):
+            query_list = [q for q in query if q]
+        else:
+            query_list = [str(query)]
+
         for q in query_list:
-            if not q or not q.strip():
+            if not q or not str(q).strip():
                 continue
-            cleaned_q = q.strip()
+            cleaned_q = str(q).strip()
             res = cls._search_duckduckgo(cleaned_q, quoted_price)
             if res:
                 return res
@@ -730,9 +738,10 @@ class MarketVerifierTool:
         # 3. Targeted AI Semantic Resolution (Only invoked when Web Search + Catalog fail)
         if LLMClient.is_available():
             semantic_meta = LLMClient.resolve_semantic_category(primary_query, specification)
-            if semantic_meta:
-                search_term = semantic_meta.get("search_term", primary_query)
-                live_result = cls._search_live_web_price(search_term, quoted_unit_price)
+            if semantic_meta and isinstance(semantic_meta, dict):
+                search_term = str(semantic_meta.get("search_term") or primary_query).strip()
+                if search_term:
+                    live_result = cls._search_live_web_price(search_term, quoted_unit_price)
                 if live_result and cls._is_price_sane(live_result["fair_price"], quoted_unit_price):
                     return MarketBenchmark(
                         item_name=item_name,

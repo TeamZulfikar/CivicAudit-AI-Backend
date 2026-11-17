@@ -425,13 +425,16 @@ async def execute_streaming_audit(req: StreamAuditRequest, request: Request):
                     "procuring_entity": req.procuring_entity or "Public Procurement Authority",
                     "raw_text": extracted_text
                 }
-                if req.filename and req.filename.lower().endswith(".json"):
-                    try:
-                        json_obj = json.loads(extracted_text)
-                        if "items" in json_obj:
+                try:
+                    clean_extracted = (extracted_text or "").strip()
+                    if clean_extracted.startswith("{") or clean_extracted.startswith("["):
+                        json_obj = json.loads(clean_extracted)
+                        if isinstance(json_obj, dict) and any(k in json_obj for k in ["items", "line_items", "boq_items"]):
                             tender_data = json_obj
-                    except Exception:
-                        pass
+                        elif isinstance(json_obj, list):
+                            tender_data["items"] = json_obj
+                except Exception:
+                    pass
 
                 if cancel_event.is_set():
                     return

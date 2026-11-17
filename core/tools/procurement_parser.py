@@ -236,12 +236,26 @@ class ProcurementParserTool:
     def parse_from_text(raw_text: str) -> List[ProcurementLineItem]:
         """
         Multi-Stage Ingestion Pipeline:
+        0. Direct JSON parsing if raw text is valid JSON (zero-token instant parse)
         1. AI LLM Extraction (high-accuracy semantic parsing for messy PDF / OCR text)
         2. Direct CSV / Tabular parsing if data resembles structured rows
         3. Heuristic regex and delimiter parsing fallback (zero-dependency)
         """
         if not raw_text or not raw_text.strip():
             return []
+
+        # Stage 0: Direct JSON parsing check
+        clean_text = raw_text.strip()
+        if clean_text.startswith("{") or clean_text.startswith("["):
+            try:
+                parsed_json = json.loads(clean_text)
+                if isinstance(parsed_json, dict):
+                    if any(k in parsed_json for k in ["items", "line_items", "boq_items"]):
+                        return ProcurementParserTool.parse_from_json(parsed_json)
+                elif isinstance(parsed_json, list):
+                    return ProcurementParserTool.parse_from_json({"items": parsed_json})
+            except Exception:
+                pass
 
         # Stage A: Try AI LLM Extraction if API is online
         if LLMClient.is_available():

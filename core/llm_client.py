@@ -30,10 +30,9 @@ class LLMClient:
     OPENROUTER_FREE_MODELS: List[str] = [
         "openrouter/free",
         "openrouter/auto",
-        "meta-llama/llama-3.3-70b-instruct:free",
         "google/gemini-2.0-flash-exp:free",
-        "deepseek/deepseek-r1:free",
         "meta-llama/llama-3.1-8b-instruct:free",
+        "deepseek/deepseek-r1:free",
         "mistralai/mistral-small-24b-instruct-2501:free",
         "qwen/qwen-2.5-coder-32b-instruct:free",
         "google/gemini-2.0-pro-exp-02-05:free",

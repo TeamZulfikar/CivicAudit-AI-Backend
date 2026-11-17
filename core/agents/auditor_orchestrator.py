@@ -78,11 +78,24 @@ class CivicAuditOrchestrator:
                 "step": "Extracting structured line-items and procurement specifications"
             }
         )
-        if "items" in tender_source_data:
+        if "items" in tender_source_data or any(k in tender_source_data for k in ["line_items", "boq_items"]):
             line_items = self.parser.parse_from_json(tender_source_data)
         else:
             raw_text = tender_source_data.get("raw_text", "")
-            line_items = self.parser.parse_from_text(raw_text)
+            clean_raw = (raw_text or "").strip()
+            if clean_raw.startswith("{") or clean_raw.startswith("["):
+                try:
+                    parsed_json = json.loads(clean_raw)
+                    if isinstance(parsed_json, dict) and any(k in parsed_json for k in ["items", "line_items", "boq_items"]):
+                        line_items = self.parser.parse_from_json(parsed_json)
+                    elif isinstance(parsed_json, list):
+                        line_items = self.parser.parse_from_json({"items": parsed_json})
+                    else:
+                        line_items = self.parser.parse_from_text(raw_text)
+                except Exception:
+                    line_items = self.parser.parse_from_text(raw_text)
+            else:
+                line_items = self.parser.parse_from_text(raw_text)
 
         total_items = max(1, len(line_items))
         self.log(
