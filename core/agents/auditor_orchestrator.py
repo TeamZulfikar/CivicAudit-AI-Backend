@@ -17,14 +17,25 @@ class CivicAuditOrchestrator:
     real-time live web inquiries, state reflection, and dossier synthesis.
     (Operates with Zero Cached Prices to uphold legal, fresh evidentiary standards).
     """
-    def __init__(self, step_callback: Optional[Callable[..., None]] = None):
+    def __init__(
+        self,
+        step_callback: Optional[Callable[..., None]] = None,
+        is_cancelled: Optional[Callable[[], bool]] = None
+    ):
         self.step_callback = step_callback or (lambda *args, **kwargs: None)
+        self.is_cancelled = is_cancelled or (lambda: False)
         self.parser = ProcurementParserTool()
         self.verifier = MarketVerifierTool()
         self.anomaly_engine = AnomalyEngineTool()
         self.dossier_generator = DossierGeneratorTool()
 
+    def check_cancel(self):
+        if self.is_cancelled and self.is_cancelled():
+            logger.warning("Audit pipeline cancellation detected. Halting further LLM calls to preserve tokens.")
+            raise InterruptedError("Audit operation cancelled by user or client disconnect.")
+
     def log(self, phase: str, message: str, data: Any = None, progress: Optional[Dict[str, Any]] = None):
+        self.check_cancel()
         logger.info(f"[{phase}] {message}")
         if self.step_callback:
             try:
@@ -102,6 +113,7 @@ class CivicAuditOrchestrator:
         findings: List[AnomalyFinding] = []
 
         for idx, item in enumerate(line_items, 1):
+            self.check_cancel()
             pct_start = int(18 + ((idx - 1) / total_items) * 72)
             anomalies_so_far = len([f for f in findings if f.risk_level != "LOW_RISK_COMPLIANT"])
 
@@ -122,9 +134,11 @@ class CivicAuditOrchestrator:
             )
             
             # Step A: Fresh real-time benchmark inquiry with item name, spec, and sanity reference
+            self.check_cancel()
             raw_benchmark = self.verifier.query_benchmark(item.name, item.specification, item.quoted_unit_price)
             
             # Step B: Convene 3-Agent Council (Scout vs Advocate vs Arbiter)
+            self.check_cancel()
             consensus_price, debate_transcript, summary = MultiAgentPriceCouncil.deliberate(item, raw_benchmark)
             
             # Step C: Anomaly Computation based on Consensus
@@ -180,6 +194,7 @@ class CivicAuditOrchestrator:
         time.sleep(0.1)
 
         # STAGE 4: SYNTHESIS & DOSSIER GENERATION
+        self.check_cancel()
         total_anomalies = len([f for f in findings if f.risk_level != "LOW_RISK_COMPLIANT"])
         self.log(
             "STAGE_4",
