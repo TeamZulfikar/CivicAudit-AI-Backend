@@ -2,7 +2,7 @@ import os
 import re
 import logging
 import statistics
-from typing import Dict, Any, Optional, List
+from typing import Dict, Any, Optional, List, Union
 import requests
 from core.models import MarketBenchmark
 from core.llm_client import LLMClient
@@ -345,6 +345,34 @@ class MarketVerifierTool:
         return clean_query if clean_query else item_name
 
     @classmethod
+    def get_optimized_queries(cls, item_name: str, specification: str = "", category: str = "") -> List[str]:
+        """
+        AI Forensic Search Query Formulation:
+        Combines deterministic regex normalization with LLM commercial search formulation.
+        Generates clean queries for e-commerce, Google Shopping, and wholesale distributors.
+        """
+        heuristic_query = cls._build_search_query(item_name, specification)
+        queries: List[str] = []
+
+        if LLMClient.is_available():
+            try:
+                ai_queries = LLMClient.generate_smart_search_queries(item_name, specification, category)
+                if ai_queries:
+                    pq = (ai_queries.get("primary_query") or "").strip()
+                    gq = (ai_queries.get("generic_query") or "").strip()
+                    if pq and pq.lower() != heuristic_query.lower():
+                        queries.append(pq)
+                    if gq and gq.lower() not in [q.lower() for q in queries] and gq.lower() != heuristic_query.lower():
+                        queries.append(gq)
+            except Exception as e:
+                logger.debug(f"AI query formulation skipped: {e}")
+
+        if heuristic_query and heuristic_query not in queries:
+            queries.append(heuristic_query)
+
+        return queries if queries else [item_name]
+
+    @classmethod
     def _is_price_sane(cls, scraped_price: float, quoted_price: float) -> bool:
         """
         Forensic Price Sanity Guard:
@@ -409,6 +437,22 @@ class MarketVerifierTool:
                 except Exception:
                     results = list(ddgs.text(search_query, max_results=5))
                 
+                # 1. Try AI Forensic Semantic Price Extraction from snippets first
+                if results and LLMClient.is_available():
+                    try:
+                        snippets = [{"title": r.get("title", ""), "body": r.get("body", "")} for r in results]
+                        ai_extract = LLMClient.extract_price_from_search_snippets(query, snippets, quoted_price)
+                        if ai_extract and cls._is_price_sane(ai_extract["fair_price"], quoted_price):
+                            evidence_url = results[0].get("href", "https://duckduckgo.com")
+                            return {
+                                "fair_price": round(ai_extract["fair_price"], 2),
+                                "source": f"Fresh AI Web Intel ({ai_extract.get('source_title', 'DuckDuckGo')})",
+                                "evidence": evidence_url,
+                                "confidence": ai_extract["confidence"]
+                            }
+                    except Exception as e:
+                        logger.debug(f"AI price extraction from DuckDuckGo skipped: {e}")
+
                 prices: List[float] = []
                 for res in results:
                     combined = f"{res.get('title', '')} {res.get('body', '')}"
@@ -461,6 +505,28 @@ class MarketVerifierTool:
             resp = requests.post(url, headers=headers, json=payload, timeout=8)
             if resp.status_code == 200:
                 data = resp.json()
+
+                # 1. Try AI Forensic Semantic Price Extraction from snippets
+                if LLMClient.is_available():
+                    try:
+                        snippets = []
+                        for shop in data.get("shopping", []):
+                            snippets.append({"title": shop.get("title", ""), "body": f"Price: {shop.get('price', '')}"})
+                        for org in data.get("organic", []):
+                            snippets.append({"title": org.get("title", ""), "body": org.get("snippet", "")})
+                        if snippets:
+                            ai_extract = LLMClient.extract_price_from_search_snippets(query, snippets, quoted_price)
+                            if ai_extract and cls._is_price_sane(ai_extract["fair_price"], quoted_price):
+                                first_link = data.get("organic", [{}])[0].get("link", "https://google.com")
+                                return {
+                                    "fair_price": round(ai_extract["fair_price"], 2),
+                                    "source": f"Fresh AI Google Intel ({ai_extract.get('source_title', 'Serper')})",
+                                    "evidence": first_link,
+                                    "confidence": ai_extract["confidence"]
+                                }
+                    except Exception as e:
+                        logger.debug(f"AI price extraction from Serper skipped: {e}")
+
                 prices = []
 
                 for shop in data.get("shopping", []):
@@ -520,7 +586,26 @@ class MarketVerifierTool:
             if resp.status_code == 200:
                 data = resp.json()
                 results = data.get("results", [])
-                
+                answer = data.get("answer", "")
+
+                # 1. Try AI Forensic Semantic Price Extraction
+                if LLMClient.is_available() and (results or answer):
+                    try:
+                        snippets = [{"title": r.get("title", ""), "body": r.get("content", "")} for r in results]
+                        if answer:
+                            snippets.insert(0, {"title": "Tavily Answer", "body": answer})
+                        ai_extract = LLMClient.extract_price_from_search_snippets(query, snippets, quoted_price)
+                        if ai_extract and cls._is_price_sane(ai_extract["fair_price"], quoted_price):
+                            evidence_url = results[0].get("url", "https://tavily.com") if results else "https://tavily.com"
+                            return {
+                                "fair_price": round(ai_extract["fair_price"], 2),
+                                "source": f"Fresh AI Tavily Intel ({ai_extract.get('source_title', 'Tavily')})",
+                                "evidence": evidence_url,
+                                "confidence": ai_extract["confidence"]
+                            }
+                    except Exception as e:
+                        logger.debug(f"AI price extraction from Tavily skipped: {e}")
+
                 prices: List[float] = []
                 answer = data.get("answer", "")
                 if answer:
@@ -559,19 +644,24 @@ class MarketVerifierTool:
         return None
 
     @classmethod
-    def _search_live_web_price(cls, query: str, quoted_price: float = 0.0) -> Optional[Dict[str, Any]]:
-        # Always try fresh live search in real-time
-        res = cls._search_duckduckgo(query, quoted_price)
-        if res:
-            return res
+    def _search_live_web_price(cls, query: Union[str, List[str]], quoted_price: float = 0.0) -> Optional[Dict[str, Any]]:
+        # Always try fresh live search in real-time across candidate queries
+        query_list = [query] if isinstance(query, str) else query
+        for q in query_list:
+            if not q or not q.strip():
+                continue
+            cleaned_q = q.strip()
+            res = cls._search_duckduckgo(cleaned_q, quoted_price)
+            if res:
+                return res
 
-        res = cls._search_serper(query, quoted_price)
-        if res:
-            return res
+            res = cls._search_serper(cleaned_q, quoted_price)
+            if res:
+                return res
 
-        res = cls._search_tavily(query, quoted_price)
-        if res:
-            return res
+            res = cls._search_tavily(cleaned_q, quoted_price)
+            if res:
+                return res
 
         return None
 
@@ -584,16 +674,17 @@ class MarketVerifierTool:
     ) -> MarketBenchmark:
         """
         Pure Real-Time Audit Resolution:
-        1. Formulate clean semantic search query (stripping codes, test tags, fusing specifications).
-        2. Query Live Web Search (DuckDuckGo Lite -> Serper -> Tavily) with Median pricing and Sanity Guard.
+        1. Formulate AI-optimized search queries (stripping codes, test tags, fusing specifications).
+        2. Query Live Web Search (DuckDuckGo Lite -> Serper -> Tavily) with AI Semantic Price Scraping.
         3. Match against Master Procurement Wholesale Schedules with Outlier Magnitude Collision Protection.
         4. Engage LLM Semantic Category Resolution only as targeted fallback for unresolved items.
         (Zero Caching - guarantees 100% fresh, contemporaneous pricing per legal requirements)
         """
-        search_query = cls._build_search_query(item_name, specification)
+        search_queries = cls.get_optimized_queries(item_name, specification)
+        primary_query = search_queries[0] if search_queries else item_name
 
-        # 1. Try Fresh Real-Time Web Search First
-        live_result = cls._search_live_web_price(search_query, quoted_unit_price)
+        # 1. Try Fresh Real-Time Web Search First with AI Multi-Query
+        live_result = cls._search_live_web_price(search_queries, quoted_unit_price)
         if live_result and cls._is_price_sane(live_result["fair_price"], quoted_unit_price):
             return MarketBenchmark(
                 item_name=item_name,
@@ -605,7 +696,7 @@ class MarketVerifierTool:
             )
 
         # 2. Match against Master Procurement Schedules (Federal, State PWD & Healthcare Baseline)
-        combined_text = f"{search_query} {item_name} {specification}".lower()
+        combined_text = f"{' '.join(search_queries)} {item_name} {specification}".lower()
         best_match = None
         for category_key, meta in cls.BENCHMARK_INDEX.items():
             for kw in meta["keywords"]:
