@@ -257,7 +257,17 @@ class ProcurementParserTool:
             except Exception:
                 pass
 
-        # Stage A: Try AI LLM Extraction if API is online
+        # Stage 1: Fast Structured CSV / Tabular Parsing via Pandas (Instant, Zero LLM Tokens)
+        # If the input text is a valid CSV (commas with rows), parse directly with Pandas first.
+        if "," in raw_text and ("\n" in raw_text or "\r" in raw_text) and "|" not in raw_text:
+            try:
+                csv_items = ProcurementParserTool.parse_from_csv(raw_text)
+                if csv_items and len(csv_items) >= 1:
+                    return csv_items
+            except Exception:
+                pass
+
+        # Stage 2: AI LLM Extraction (High-accuracy semantic parsing for messy PDF / OCR / unstructured text)
         if LLMClient.is_available():
             try:
                 llm_items = LLMClient.parse_messy_tender_text(raw_text)
@@ -295,16 +305,7 @@ class ProcurementParserTool:
             except Exception:
                 pass
 
-        # Stage B: Try Structured CSV Parsing only if text has genuine CSV structure (commas and no pipes)
-        if "," in raw_text and ("\n" in raw_text or "\r" in raw_text) and "|" not in raw_text:
-            try:
-                csv_items = ProcurementParserTool.parse_from_csv(raw_text)
-                if csv_items and len(csv_items) >= 1:
-                    return csv_items
-            except Exception:
-                pass
-
-        # Stage C: Deterministic Heuristic Line Parsing
+        # Stage 3: Deterministic Heuristic Line Parsing
         items: List[ProcurementLineItem] = []
         lines = [line.strip() for line in raw_text.splitlines() if line.strip()]
         item_counter = 1
