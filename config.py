@@ -18,7 +18,7 @@ class AuditConfig:
     # 'hybrid': Live LLM debate on flagged anomalies; deterministic on compliant items
     # 'deterministic': High-speed mathematical statutory formula fallback
     COUNCIL_MODE: str = os.getenv("COUNCIL_MODE", "llm").lower()
-    COUNCIL_BATCH_SIZE: int = int(os.getenv("COUNCIL_BATCH_SIZE", "20"))
+    COUNCIL_BATCH_SIZE: int = int(os.getenv("COUNCIL_BATCH_SIZE", "1"))
     
     # Paths
     DATA_DIR: Path = BASE_DIR / "data"

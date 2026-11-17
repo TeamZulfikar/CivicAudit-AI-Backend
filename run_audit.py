@@ -21,6 +21,15 @@ def cli_callback(phase: str, message: str, data=None):
         console.print(f"[bold blue]📄 [STAGE 1 - EXTRACTION][/bold blue] {message}")
     elif phase == "STAGE_2":
         console.print(f"[bold magenta]🌐 [STAGE 2 - MARKET INTEL][/bold magenta] {message}")
+    elif phase == "DEBATE":
+        console.print(f"\n[bold cyan]{message}[/bold cyan]")
+        if isinstance(data, list):
+            for turn in data:
+                avatar = getattr(turn, "avatar", "⚖️")
+                agent_name = getattr(turn, "agent_name", "Council")
+                argument = getattr(turn, "argument", "")
+                console.print(f"   [yellow]{avatar} {agent_name}:[/yellow] {argument}")
+        console.print()
     elif phase == "ALERT":
         console.print(f"[bold red]{message}[/bold red]")
     elif phase == "STAGE_4":
