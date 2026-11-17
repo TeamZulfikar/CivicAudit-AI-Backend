@@ -729,9 +729,9 @@ class MarketVerifierTool:
 
         # 3. Targeted AI Semantic Resolution (Only invoked when Web Search + Catalog fail)
         if LLMClient.is_available():
-            semantic_meta = LLMClient.resolve_semantic_category(search_query, specification)
+            semantic_meta = LLMClient.resolve_semantic_category(primary_query, specification)
             if semantic_meta:
-                search_term = semantic_meta.get("search_term", search_query)
+                search_term = semantic_meta.get("search_term", primary_query)
                 live_result = cls._search_live_web_price(search_term, quoted_unit_price)
                 if live_result and cls._is_price_sane(live_result["fair_price"], quoted_unit_price):
                     return MarketBenchmark(

@@ -7,6 +7,7 @@ from core.tools.market_verifier import MarketVerifierTool
 from core.tools.anomaly_engine import AnomalyEngineTool
 from core.tools.dossier_generator import DossierGeneratorTool
 from core.agents.consensus_council import MultiAgentPriceCouncil
+from config import AuditConfig
 
 logger = logging.getLogger("CivicAudit.Orchestrator")
 
@@ -111,85 +112,96 @@ class CivicAuditOrchestrator:
             }
         )
         findings: List[AnomalyFinding] = []
+        batch_size = max(1, getattr(AuditConfig, "COUNCIL_BATCH_SIZE", 20))
 
-        for idx, item in enumerate(line_items, 1):
+        for batch_start in range(0, len(line_items), batch_size):
             self.check_cancel()
-            pct_start = int(18 + ((idx - 1) / total_items) * 72)
-            anomalies_so_far = len([f for f in findings if f.risk_level != "LOW_RISK_COMPLIANT"])
+            batch_slice = line_items[batch_start:batch_start + batch_size]
 
-            self.log(
-                "STAGE_2",
-                f"[{idx}/{len(line_items)}] Conducting Fresh Live Inquiry on '{item.name}' (Quoted: ${item.quoted_unit_price:,.2f})...",
-                progress={
-                    "percentage": pct_start,
-                    "stage": 2,
-                    "stage_name": "Market Telemetry Inquiry",
-                    "step": f"Inquiring wholesale benchmark for '{item.name}'",
-                    "current_item_index": idx,
-                    "total_items": len(line_items),
-                    "current_item_name": item.name,
-                    "quoted_price": item.quoted_unit_price,
-                    "anomalies_count": anomalies_so_far
-                }
-            )
-            
-            # Step A: Fresh real-time benchmark inquiry with item name, spec, and sanity reference
-            self.check_cancel()
-            raw_benchmark = self.verifier.query_benchmark(item.name, item.specification, item.quoted_unit_price)
-            
-            # Step B: Convene 3-Agent Council (Scout vs Advocate vs Arbiter)
-            self.check_cancel()
-            consensus_price, debate_transcript, summary = MultiAgentPriceCouncil.deliberate(item, raw_benchmark)
-            
-            # Step C: Anomaly Computation based on Consensus
-            finding = self.anomaly_engine.evaluate_item(
-                item=item,
-                benchmark=raw_benchmark,
-                consensus_price=consensus_price,
-                debate_transcript=debate_transcript
-            )
-            findings.append(finding)
+            # Step A: Query wholesale benchmarks for all items in this micro-batch
+            batch_benchmarks = []
+            for sub_idx, item in enumerate(batch_slice):
+                self.check_cancel()
+                idx = batch_start + sub_idx + 1
+                pct_start = int(18 + ((idx - 1) / total_items) * 72)
+                anomalies_so_far = len([f for f in findings if f.risk_level != "LOW_RISK_COMPLIANT"])
 
-            pct_end = int(18 + (idx / total_items) * 72)
-            anomalies_updated = len([f for f in findings if f.risk_level != "LOW_RISK_COMPLIANT"])
-
-            self.log(
-                "DEBATE",
-                f"🏛️ [Agent Debate on '{item.name}']: Floor ${raw_benchmark.fair_market_unit_price:,.2f} -> "
-                f"Council Consensus Established at ${consensus_price:,.2f}",
-                debate_transcript,
-                progress={
-                    "percentage": pct_end,
-                    "stage": 2,
-                    "stage_name": "Tribunal Consensus Established",
-                    "step": f"Consensus price: ${consensus_price:,.2f} (Quoted: ${item.quoted_unit_price:,.2f})",
-                    "current_item_index": idx,
-                    "total_items": len(line_items),
-                    "current_item_name": item.name,
-                    "consensus_price": consensus_price,
-                    "quoted_price": item.quoted_unit_price,
-                    "anomalies_count": anomalies_updated
-                }
-            )
-
-            if finding.risk_level == "CRITICAL_RED_FLAG":
                 self.log(
-                    "ALERT",
-                    f"⚠️ CRITICAL GOUGING CONFIRMED on '{item.name}': "
-                    f"Quoted ${item.quoted_unit_price:,.2f} vs Consensus ${consensus_price:,.2f} "
-                    f"(+{finding.gouging_percentage:.1f}%)",
-                    finding,
+                    "STAGE_2",
+                    f"[{idx}/{len(line_items)}] Conducting Fresh Live Inquiry on '{item.name}' (Quoted: ${item.quoted_unit_price:,.2f})...",
                     progress={
-                        "percentage": pct_end,
+                        "percentage": pct_start,
                         "stage": 2,
-                        "stage_name": "Critical Anomaly Detected",
-                        "step": f"Flagged +{finding.gouging_percentage:.1f}% markup on '{item.name}'",
+                        "stage_name": "Market Telemetry Inquiry",
+                        "step": f"Inquiring wholesale benchmark for '{item.name}'",
                         "current_item_index": idx,
                         "total_items": len(line_items),
                         "current_item_name": item.name,
+                        "quoted_price": item.quoted_unit_price,
+                        "anomalies_count": anomalies_so_far
+                    }
+                )
+                raw_benchmark = self.verifier.query_benchmark(item.name, item.specification, item.quoted_unit_price)
+                batch_benchmarks.append(raw_benchmark)
+
+            # Step B: Convene Micro-Batch Multi-Agent Council (single LLM prompt for entire batch)
+            self.check_cancel()
+            batch_tuples = list(zip(batch_slice, batch_benchmarks))
+            batch_deliberations = MultiAgentPriceCouncil.deliberate_batch(batch_tuples)
+
+            # Step C: Evaluate Anomaly Findings & Stream Deliberation Logs Per Item
+            for sub_idx, (item, raw_benchmark, (consensus_price, debate_transcript, summary)) in enumerate(
+                zip(batch_slice, batch_benchmarks, batch_deliberations)
+            ):
+                idx = batch_start + sub_idx + 1
+                finding = self.anomaly_engine.evaluate_item(
+                    item=item,
+                    benchmark=raw_benchmark,
+                    consensus_price=consensus_price,
+                    debate_transcript=debate_transcript
+                )
+                findings.append(finding)
+
+                pct_end = int(18 + (idx / total_items) * 72)
+                anomalies_updated = len([f for f in findings if f.risk_level != "LOW_RISK_COMPLIANT"])
+
+                self.log(
+                    "DEBATE",
+                    f"🏛️ [Agent Debate on '{item.name}']: Floor ${raw_benchmark.fair_market_unit_price:,.2f} -> "
+                    f"Council Consensus Established at ${consensus_price:,.2f}",
+                    debate_transcript,
+                    progress={
+                        "percentage": pct_end,
+                        "stage": 2,
+                        "stage_name": "Tribunal Consensus Established",
+                        "step": f"Consensus price: ${consensus_price:,.2f} (Quoted: ${item.quoted_unit_price:,.2f})",
+                        "current_item_index": idx,
+                        "total_items": len(line_items),
+                        "current_item_name": item.name,
+                        "consensus_price": consensus_price,
+                        "quoted_price": item.quoted_unit_price,
                         "anomalies_count": anomalies_updated
                     }
                 )
+
+                if finding.risk_level == "CRITICAL_RED_FLAG":
+                    self.log(
+                        "ALERT",
+                        f"⚠️ CRITICAL GOUGING CONFIRMED on '{item.name}': "
+                        f"Quoted ${item.quoted_unit_price:,.2f} vs Consensus ${consensus_price:,.2f} "
+                        f"(+{finding.gouging_percentage:.1f}%)",
+                        finding,
+                        progress={
+                            "percentage": pct_end,
+                            "stage": 2,
+                            "stage_name": "Critical Anomaly Detected",
+                            "step": f"Flagged +{finding.gouging_percentage:.1f}% markup on '{item.name}'",
+                            "current_item_index": idx,
+                            "total_items": len(line_items),
+                            "current_item_name": item.name,
+                            "anomalies_count": anomalies_updated
+                        }
+                    )
 
         time.sleep(0.1)
 
