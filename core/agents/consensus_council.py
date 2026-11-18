@@ -55,6 +55,151 @@ class MultiAgentPriceCouncil:
             return cls.deliberate_llm(item, raw_benchmark)
 
     @classmethod
+    def deliberate_batch(
+        cls,
+        batch: List[Tuple[ProcurementLineItem, MarketBenchmark]]
+    ) -> List[Tuple[float, List[AgentDebateTurn], str]]:
+        """
+        Micro-Batching & Map-Reduce Multi-Agent Consensus Tribunal:
+        Evaluates a batch of line items (e.g. 15-25 items) in a single LLM prompt,
+        reducing API roundtrips by 90-95% and eliminating per-item system prompt token overhead.
+        """
+        if not batch:
+            return []
+
+        mode = getattr(AuditConfig, "COUNCIL_MODE", "llm").lower()
+        if mode == "deterministic" or not LLMClient.is_available():
+            return [cls.deliberate_deterministic(it, bm) for it, bm in batch]
+
+        if mode == "hybrid":
+            results = [None] * len(batch)
+            flagged_indices = []
+            flagged_sub_batch = []
+            for idx, (it, bm) in enumerate(batch):
+                quoted = max(0.0, float(it.quoted_unit_price))
+                floor = max(0.01, float(bm.fair_market_unit_price))
+                if quoted > (floor * 1.25):
+                    flagged_indices.append(idx)
+                    flagged_sub_batch.append((it, bm))
+                else:
+                    results[idx] = cls.deliberate_deterministic(it, bm)
+
+            if flagged_sub_batch:
+                sub_results = cls._deliberate_batch_llm(flagged_sub_batch)
+                for f_idx, res in zip(flagged_indices, sub_results):
+                    results[f_idx] = res
+
+            return results
+        else:
+            # Full LLM batch mode
+            return cls._deliberate_batch_llm(batch)
+
+    @classmethod
+    def _deliberate_batch_llm(
+        cls,
+        batch: List[Tuple[ProcurementLineItem, MarketBenchmark]]
+    ) -> List[Tuple[float, List[AgentDebateTurn], str]]:
+        """
+        Executes a single structured Micro-Batch LLM deliberation across multiple items.
+        Falls back to deliberate_deterministic on any individual parsing failure.
+        """
+        items_payload = []
+        for idx, (it, bm) in enumerate(batch):
+            quoted = max(0.0, float(it.quoted_unit_price))
+            floor = max(0.01, float(bm.fair_market_unit_price))
+            markup = round(((quoted - floor) / floor * 100), 1) if floor > 0 else 0.0
+            item_key = str(it.item_id or f"ITEM-{idx+1:03d}").strip()
+            items_payload.append({
+                "item_id": item_key,
+                "name": it.name,
+                "specification": it.specification,
+                "quantity": it.quantity,
+                "quoted_unit_rate": quoted,
+                "wholesale_floor_rate": floor,
+                "markup_percentage": markup,
+                "benchmark_source": bm.price_source
+            })
+
+        system_instruction = (
+            "You are the Supreme Forensic Procurement Tribunal comprising 3 adversarial personas:\n"
+            "1. Agent Scout (Market Data Investigator): Challenges unjustified price gouging over wholesale trading floor.\n"
+            "2. Agent Advocate (Procurement Economist): Defends legitimate statutory overheads (15% VAT, 7.5% AIT, freight, warranty ~25% cushion).\n"
+            "3. Chief Auditor (Judicial Arbiter): Issues legally binding statutory consensus ceiling price in USD.\n\n"
+            "Evaluate each procurement line item in the provided JSON batch.\n"
+            "For each item, formulate:\n"
+            "- 'item_id': str (must match input item_id exactly)\n"
+            "- 'consensus_price': float (binding fair ceiling unit price in USD, usually between floor and floor * 1.25 unless higher is economically justified)\n"
+            "- 'scout_argument': str (concise challenge on floor discrepancy)\n"
+            "- 'advocate_argument': str (concise economic defense regarding tax/cushion)\n"
+            "- 'auditor_ruling': str (judicial consensus verdict reasoning)\n"
+            "- 'verdict': str ('APPROVED' | 'FLAGGED_OVERCHARGE' | 'CRITICAL_GOUGING')\n\n"
+            "Return strictly a valid JSON array of objects, one per item in the batch. No conversational intro or markdown prose."
+        )
+
+        user_prompt = f"Batch Procurement Deliberation ({len(items_payload)} items):\n" + json.dumps(items_payload, indent=2)
+
+        try:
+            raw_resp = LLMClient.complete(
+                prompt=user_prompt,
+                system_instruction=system_instruction,
+                temperature=0.2
+            )
+            if not raw_resp:
+                raise ValueError("Empty response from LLM batch council")
+
+            cleaned = raw_resp.strip()
+            cleaned = re.sub(r'^```(?:json)?\s*', '', cleaned, flags=re.MULTILINE)
+            cleaned = re.sub(r'```\s*$', '', cleaned, flags=re.MULTILINE).strip()
+            array_match = re.search(r'\[.*\]', cleaned, re.DOTALL)
+            if array_match:
+                cleaned = array_match.group(0)
+            cleaned = re.sub(r',\s*\]', ']', cleaned)
+            parsed_rulings = json.loads(cleaned)
+
+            rulings_map = {}
+            if isinstance(parsed_rulings, list):
+                for r in parsed_rulings:
+                    if isinstance(r, dict) and r.get("item_id"):
+                        rulings_map[str(r["item_id"]).strip().lower()] = r
+
+            results = []
+            for idx, (it, bm) in enumerate(batch):
+                item_key = str(it.item_id or f"ITEM-{idx+1:03d}").strip().lower()
+                decision = rulings_map.get(item_key)
+                if not decision and isinstance(parsed_rulings, list) and idx < len(parsed_rulings):
+                    decision = parsed_rulings[idx] if isinstance(parsed_rulings[idx], dict) else None
+
+                if decision:
+                    quoted = max(0.0, float(it.quoted_unit_price))
+                    floor_price = max(0.01, float(bm.fair_market_unit_price))
+                    default_ceiling = round(floor_price * 1.25, 2)
+                    consensus = safe_float(decision.get("consensus_price"), default_ceiling)
+                    if consensus <= 0.0 or consensus < (floor_price * 0.5) or consensus > (max(quoted, floor_price) * 1.5):
+                        consensus = default_ceiling
+
+                    scout_text = str(decision.get("scout_argument") or f"Scout verified baseline trading floor at ${floor_price:,.2f}.").strip()
+                    advocate_text = str(decision.get("advocate_argument") or f"Advocate notes statutory tax/overhead tolerance up to ${default_ceiling:,.2f}.").strip()
+                    auditor_text = str(decision.get("auditor_ruling") or f"Tribunal consensus established at ${consensus:,.2f}.").strip()
+                    verdict = str(decision.get("verdict") or "APPROVED").strip()
+
+                    transcript = [
+                        AgentDebateTurn(agent_name="Agent Scout (Intel)", role="Market Data Investigator", avatar="🕵️‍♂️", argument=scout_text),
+                        AgentDebateTurn(agent_name="Agent Advocate (Vendor)", role="Procurement Economics Specialist", avatar="💼", argument=advocate_text),
+                        AgentDebateTurn(agent_name="Chief Auditor (Arbiter)", role="Public Integrity Officer", avatar="⚖️", argument=f"Tribunal Ruling: {auditor_text} [VERDICT: {verdict}]")
+                    ]
+                    provider_name = getattr(LLMClient, "get_active_provider_name", lambda: "Multi-Agent Pool")()
+                    notes = f"Batch Micro-Council Deliberation via {provider_name} (Consensus: ${consensus:,.2f})"
+                    results.append((consensus, transcript, notes))
+                else:
+                    results.append(cls.deliberate_deterministic(it, bm))
+
+            return results
+
+        except Exception as e:
+            logger.warning(f"Batch LLM deliberation failed ({e}). Falling back to deterministic council...")
+            return [cls.deliberate_deterministic(it, bm) for it, bm in batch]
+
+    @classmethod
     def deliberate_llm(
         cls,
         item: ProcurementLineItem,

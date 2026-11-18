@@ -5,6 +5,7 @@ import re
 from typing import List, Dict, Any, Optional
 import requests
 from config import AuditConfig
+from core.tools.type_utils import safe_float
 
 logger = logging.getLogger("CivicAudit.LLMClient")
 
@@ -29,10 +30,9 @@ class LLMClient:
     OPENROUTER_FREE_MODELS: List[str] = [
         "openrouter/free",
         "openrouter/auto",
-        "meta-llama/llama-3.3-70b-instruct:free",
         "google/gemini-2.0-flash-exp:free",
-        "deepseek/deepseek-r1:free",
         "meta-llama/llama-3.1-8b-instruct:free",
+        "deepseek/deepseek-r1:free",
         "mistralai/mistral-small-24b-instruct-2501:free",
         "qwen/qwen-2.5-coder-32b-instruct:free",
         "google/gemini-2.0-pro-exp-02-05:free",
@@ -519,6 +519,23 @@ class LLMClient:
             if isinstance(parsed, list):
                 return parsed
         except Exception as e:
+            # Resilient recovery for partial/truncated LLM outputs
+            try:
+                obj_matches = re.findall(r'\{[^{}]*\}', raw_res)
+                repaired = []
+                for om in obj_matches:
+                    try:
+                        clean_om = re.sub(r',\s*\}', '}', om)
+                        item = json.loads(clean_om)
+                        if isinstance(item, dict) and any(k in item for k in ["name", "item_name", "description"]):
+                            repaired.append(item)
+                    except Exception:
+                        continue
+                if repaired:
+                    logger.info(f"✅ Recovered {len(repaired)} items from partial/truncated LLM response.")
+                    return repaired
+            except Exception:
+                pass
             logger.warning(f"Failed to parse LLM JSON extraction: {e}")
         return None
 
@@ -554,3 +571,127 @@ class LLMClient:
         except Exception as e:
             logger.warning(f"Failed to parse LLM semantic resolution: {e}")
             return None
+
+    @classmethod
+    def generate_smart_search_queries(cls, item_name: str, specification: str = "", category: str = "") -> Optional[Dict[str, str]]:
+        """
+        AI Forensic Search Query Formulation:
+        Transforms messy, verbose, or unstructured tender line item descriptions
+        (e.g., 'Supply, fitting and fixing of 4K PTZ outdoor camera with IP66 casing and mounting bracket')
+        into clean, highly targeted commercial wholesale search queries.
+        
+        Returns:
+            {
+                "primary_query": "4K Outdoor PTZ Security Camera IP66",
+                "generic_query": "PTZ CCTV Security Camera"
+            }
+        """
+        if not cls.is_available():
+            return None
+
+        system_instruction = (
+            "You are a forensic commercial procurement price search engineer. "
+            "Given an item from an invoice or tender (which often contains tender legalese like "
+            "'Supply of', 'Providing and fixing', 'Turnkey', internal codes, or verbose warranties), "
+            "formulate precise, commercial product search queries suitable for e-commerce and wholesale pricing lookup.\n"
+            "Rules:\n"
+            "1. 'primary_query': Extract the exact commercial product name and critical technical specs (model, size, capacity). "
+            "Strip internal codes (e.g. CIV-049, IT-008), filler words ('Supply of', 'Installation', 'Turnkey basis'), and warranty text.\n"
+            "2. 'generic_query': Provide the standard commercial product category name as a fallback.\n"
+            "Return strictly a JSON object with keys 'primary_query' (str) and 'generic_query' (str). "
+            "No conversational markdown, explanation, or commentary."
+        )
+
+        prompt = f"Item Name: {item_name}\nSpecification: {specification}\nCategory: {category}"
+        raw_res = cls.complete(prompt, system_instruction)
+        if not raw_res:
+            return None
+
+        try:
+            cleaned = raw_res.strip()
+            cleaned = re.sub(r'^```(?:json)?\s*', '', cleaned, flags=re.MULTILINE)
+            cleaned = re.sub(r'```\s*$', '', cleaned, flags=re.MULTILINE).strip()
+            obj_match = re.search(r'\{.*\}', cleaned, re.DOTALL)
+            if obj_match:
+                cleaned = obj_match.group(0)
+            cleaned = re.sub(r',\s*\}', '}', cleaned)
+            data = json.loads(cleaned)
+            if isinstance(data, dict) and data.get("primary_query"):
+                return {
+                    "primary_query": str(data["primary_query"]).strip(),
+                    "generic_query": str(data.get("generic_query", "")).strip()
+                }
+        except Exception as e:
+            logger.warning(f"Failed to parse LLM search query formulation: {e}")
+        return None
+
+    @classmethod
+    def extract_price_from_search_snippets(
+        cls,
+        product_query: str,
+        snippets: List[Dict[str, str]],
+        quoted_unit_price: float = 0.0
+    ) -> Optional[Dict[str, Any]]:
+        """
+        AI Forensic Price Scraper / Evaluator:
+        Reads web search titles and snippets (from DuckDuckGo / Serper / Tavily) to extract the
+        genuine commercial/wholesale single-unit price in USD.
+        Filters out delivery fees, accessories, monthly installments, or MSRP anchors.
+        """
+        if not cls.is_available() or not snippets:
+            return None
+
+        system_instruction = (
+            "You are a forensic commercial procurement price auditor. "
+            "You are given search result snippets from wholesale and retail suppliers for a specific product. "
+            "Extract the genuine single-unit commercial or wholesale purchase price in USD.\n"
+            "Strict Guidelines:\n"
+            "1. Ignore shipping/delivery fees, accessory add-ons, monthly lease/installment amounts, and discount savings.\n"
+            "2. Extract the price for 1 unit (e.g. if price is per box of 10, calculate price for 1 unit if stated).\n"
+            "3. Reject irrelevant items, replacement spare parts, or toys/mini models.\n"
+            "Return strictly JSON with keys:\n"
+            "- 'extracted_price': float (or null if no genuine price is found)\n"
+            "- 'confidence': float (between 0.70 and 0.98)\n"
+            "- 'source_title': str (the title of the source where the price was found)"
+        )
+
+        formatted_snippets = []
+        for idx, s in enumerate(snippets[:5], 1):
+            title = s.get("title", "")
+            snippet = s.get("body", "") or s.get("snippet", "")
+            if title or snippet:
+                formatted_snippets.append(f"Result {idx}: [{title}] - {snippet}")
+
+        if not formatted_snippets:
+            return None
+
+        prompt = (
+            f"Product: {product_query}\n"
+            f"Tender Quoted Unit Price: ${quoted_unit_price:,.2f}\n"
+            f"Search Snippets:\n" + "\n".join(formatted_snippets)
+        )
+
+        raw_res = cls.complete(prompt, system_instruction)
+        if not raw_res:
+            return None
+
+        try:
+            cleaned = raw_res.strip()
+            cleaned = re.sub(r'^```(?:json)?\s*', '', cleaned, flags=re.MULTILINE)
+            cleaned = re.sub(r'```\s*$', '', cleaned, flags=re.MULTILINE).strip()
+            obj_match = re.search(r'\{.*\}', cleaned, re.DOTALL)
+            if obj_match:
+                cleaned = obj_match.group(0)
+            cleaned = re.sub(r',\s*\}', '}', cleaned)
+            data = json.loads(cleaned)
+            if isinstance(data, dict):
+                price = safe_float(data.get("extracted_price"), 0.0)
+                if price > 0.0:
+                    return {
+                        "fair_price": price,
+                        "confidence": min(0.98, max(0.70, safe_float(data.get("confidence"), 0.92))),
+                        "source_title": str(data.get("source_title", "Live Commercial Web Listing"))
+                    }
+        except Exception as e:
+            logger.warning(f"Failed to parse LLM price extraction: {e}")
+        return None

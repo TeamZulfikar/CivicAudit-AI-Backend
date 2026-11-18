@@ -316,8 +316,17 @@ def upload_and_audit(req: FileUploadRequest):
             "raw_text": extracted_text
         }
 
+        # If it's a CSV or Excel file, parse directly with Pandas (0 tokens)
+        filename_lower = (req.filename or "").lower()
+        if filename_lower.endswith(".csv") or filename_lower.endswith((".xlsx", ".xls")):
+            try:
+                csv_items = ProcurementParserTool.parse_from_csv(extracted_text)
+                if csv_items and len(csv_items) >= 1:
+                    tender_data["items"] = [it.model_dump() for it in csv_items]
+            except Exception:
+                pass
         # If it's a JSON file, parse directly
-        if req.filename.lower().endswith(".json"):
+        elif filename_lower.endswith(".json"):
             try:
                 json_obj = json.loads(extracted_text)
                 if "items" in json_obj:
@@ -425,11 +434,23 @@ async def execute_streaming_audit(req: StreamAuditRequest, request: Request):
                     "procuring_entity": req.procuring_entity or "Public Procurement Authority",
                     "raw_text": extracted_text
                 }
-                if req.filename and req.filename.lower().endswith(".json"):
+                upload_filename = (req.filename or "").lower()
+                if upload_filename.endswith(".csv") or upload_filename.endswith((".xlsx", ".xls")):
                     try:
-                        json_obj = json.loads(extracted_text)
-                        if "items" in json_obj:
-                            tender_data = json_obj
+                        csv_items = ProcurementParserTool.parse_from_csv(extracted_text)
+                        if csv_items and len(csv_items) >= 1:
+                            tender_data["items"] = [it.model_dump() for it in csv_items]
+                    except Exception:
+                        pass
+                else:
+                    try:
+                        clean_extracted = (extracted_text or "").strip()
+                        if clean_extracted.startswith("{") or clean_extracted.startswith("["):
+                            json_obj = json.loads(clean_extracted)
+                            if isinstance(json_obj, dict) and any(k in json_obj for k in ["items", "line_items", "boq_items"]):
+                                tender_data = json_obj
+                            elif isinstance(json_obj, list):
+                                tender_data["items"] = json_obj
                     except Exception:
                         pass
 
